@@ -9,6 +9,16 @@
 `define MAX_LATENCY     1000
 `define DIRECTED_NUM    13          // corner-case patterns before the random ones
 
+// Two modes
+//   default          : read ../00_TESTBED/input.txt and output.txt, drive the DUT, compare
+//   +define+GEN_DATA : generate random / directed data, compute the golden answer with the
+//                      DesignWare IP and write input.txt / output.txt (the DUT is not run)
+//
+// input.txt  (per pattern, 208 words) : 64 lines "K Q V" (raster order, hex), then 16 lines "out_weight"
+// output.txt (per pattern,  64 words) : 64 lines of the expected out (raster order, hex)
+`define INPUT_FILE      "../00_TESTBED/input.txt"
+`define OUTPUT_FILE     "../00_TESTBED/output.txt"
+
 
 
 module PATTERN (
@@ -58,24 +68,15 @@ always #(CYCLE/2.0) clk = ~clk;
 initial clk = 1'b0;
 
 //=============================================================================
-// Data storage (all patterns are prepared before the simulation starts)
+// Common variables / helpers
 //=============================================================================
-reg [31:0] q_mem    [0:`PATTERN_NUMBER*64-1];
-reg [31:0] k_mem    [0:`PATTERN_NUMBER*64-1];
-reg [31:0] v_mem    [0:`PATTERN_NUMBER*64-1];
-reg [31:0] w_mem    [0:`PATTERN_NUMBER*16-1];
-reg [31:0] gold_mem [0:`PATTERN_NUMBER*64-1];
-
 integer seed;
 integer pat, i, lat, gap;
 integer total_lat, max_lat;
-integer gb, gwb;                     // base index of the pattern being prepared
 real    max_err, cur_err, gold_r, out_r;
 reg     chk_en;                      // idle monitor enable (after reset)
 
-//=============================================================================
-// float32 <-> real  (plain Verilog-2001)
-//=============================================================================
+// float32 bit pattern -> real
 function real f32_to_real;
     input [31:0] b;
     integer ex;
@@ -86,6 +87,42 @@ function real f32_to_real;
         if (ex == 0) v = 0.0;
         else         v = (1.0 + fr / 8388608.0) * (2.0 ** (ex - 127));
         f32_to_real = b[31] ? -v : v;
+    end
+endfunction
+
+function real fabs;
+    input real x;
+    begin
+        fabs = (x < 0.0) ? -x : x;
+    end
+endfunction
+
+task drive_idle;
+    begin
+        in_valid   = 1'b0;
+        Q          = 32'bx;
+        K          = 32'bx;
+        V          = 32'bx;
+        out_weight = 32'bx;
+    end
+endtask
+
+
+`ifdef GEN_DATA
+//#############################################################################
+//  GENERATION MODE : data + golden -> input.txt / output.txt
+//#############################################################################
+reg [31:0] q_mem    [0:`PATTERN_NUMBER*64-1];
+reg [31:0] k_mem    [0:`PATTERN_NUMBER*64-1];
+reg [31:0] v_mem    [0:`PATTERN_NUMBER*64-1];
+reg [31:0] w_mem    [0:`PATTERN_NUMBER*16-1];
+reg [31:0] gold_mem [0:`PATTERN_NUMBER*64-1];
+integer gb, gwb;                     // base index of the pattern being prepared
+
+function [31:0] neg;
+    input [31:0] x;
+    begin
+        neg = {~x[31], x[30:0]};
     end
 endfunction
 
@@ -119,23 +156,6 @@ function [31:0] real_to_f32;
     end
 endfunction
 
-function real fabs;
-    input real x;
-    begin
-        fabs = (x < 0.0) ? -x : x;
-    end
-endfunction
-
-function [31:0] neg;
-    input [31:0] x;
-    begin
-        neg = {~x[31], x[30:0]};
-    end
-endfunction
-
-//=============================================================================
-// Random data
-//=============================================================================
 function real urand;                 // uniform in [0,1)
     input dummy;
     reg [31:0] r;
@@ -188,19 +208,21 @@ task fill_w; input [31:0] c; begin for (i = 0; i < 16; i = i + 1) w_mem[gwb + i]
 // corner cases: exp() range, running max tracking, zero data
 task directed_task;
     input integer p;
-    integer t, d, kind, mode;
+    integer t, d;
     begin
         case (p)
-            0: begin fill_q(F_HALF); fill_k(F_255);         rnd_v;        rnd_w;        end // all scores max positive
-            1: begin fill_q(F_HALF); fill_k(neg(F_255));    rnd_v;        rnd_w;        end // all scores max negative
-            2: begin fill_q(32'd0);  rnd_k;                 rnd_v;        rnd_w;        end // all scores 0
-            3: begin rnd_q;          rnd_k;                 fill_v(32'd0); rnd_w;       end // V = 0
-            4: begin rnd_q;          rnd_k;                 rnd_v;        fill_w(32'd0); end // W = 0
-            5: begin rnd_q;          for (i = 0; i < 64; i = i + 1) k_mem[gb + i] = {$random(seed)} % 2 ? neg(F_HALF) : F_HALF;
-                     rnd_v; rnd_w; end                                                    // smallest keys
-            12: begin fill_q(F_HALF); for (i = 0; i < 64; i = i + 1) k_mem[gb + i] = neg(rand_f32(0.5, 255.0, 0) & 32'h7FFFFFFF);
-                     rnd_v; rnd_w; end                                                    // every score negative
-            default: begin                                                                // one dominant key token
+            0: begin fill_q(F_HALF); fill_k(F_255);         rnd_v;         rnd_w;         end // all scores max positive
+            1: begin fill_q(F_HALF); fill_k(neg(F_255));    rnd_v;         rnd_w;         end // all scores max negative
+            2: begin fill_q(32'd0);  rnd_k;                 rnd_v;         rnd_w;         end // all scores 0
+            3: begin rnd_q;          rnd_k;                 fill_v(32'd0); rnd_w;         end // V = 0
+            4: begin rnd_q;          rnd_k;                 rnd_v;         fill_w(32'd0); end // W = 0
+            5: begin rnd_q;                                                                    // smallest keys
+                     for (i = 0; i < 64; i = i + 1) k_mem[gb + i] = {$random(seed)} % 2 ? neg(F_HALF) : F_HALF;
+                     rnd_v; rnd_w; end
+            12: begin fill_q(F_HALF);                                                          // every score negative
+                     for (i = 0; i < 64; i = i + 1) k_mem[gb + i] = neg(rand_f32(0.5, 255.0, 0) & 32'h7FFFFFFF);
+                     rnd_v; rnd_w; end
+            default: begin                                                                     // one dominant key token
                 case (p)
                     6:  t = 0;
                     7:  t = 1;
@@ -238,9 +260,9 @@ task gen_task;
     end
 endtask
 
-//=============================================================================
-// Golden model: tiled online softmax built from the same DesignWare IP
-//=============================================================================
+//-----------------------------------------------------------------------------
+// Golden model: tiled online softmax built from the same DesignWare IP as F_ATTN
+//-----------------------------------------------------------------------------
 reg  [31:0] gm_a, gm_b;  wire [31:0] gm_z;
 reg  [31:0] ga_a, ga_b;  wire [31:0] ga_z;
 reg  [31:0] gd_a, gd_b;  wire [31:0] gd_z;
@@ -374,9 +396,51 @@ task golden_task;
     end
 endtask
 
-//=============================================================================
+integer fin, fout, pp;
+initial begin
+    force clk = 1'b0;
+    rst_n = 1'b1;
+    drive_idle;
+    seed = `SEED_NUMBER;
+
+    for (pat = 0; pat < `PATTERN_NUMBER; pat = pat + 1) begin
+        gen_task(pat);
+        golden_task(pat);
+        if ((pat % 100) == 99) $display("  [PATTERN] %0d / %0d patterns prepared", pat + 1, `PATTERN_NUMBER);
+    end
+
+    fin  = $fopen(`INPUT_FILE,  "w");
+    fout = $fopen(`OUTPUT_FILE, "w");
+    for (pp = 0; pp < `PATTERN_NUMBER; pp = pp + 1) begin
+        $fdisplay(fin,  "// pattern %0d", pp);
+        for (i = 0; i < 64; i = i + 1)
+            $fdisplay(fin, "%h %h %h", k_mem[pp*64 + i], q_mem[pp*64 + i], v_mem[pp*64 + i]);
+        for (i = 0; i < 16; i = i + 1)
+            $fdisplay(fin, "%h", w_mem[pp*16 + i]);
+        $fdisplay(fout, "// pattern %0d", pp);
+        for (i = 0; i < 64; i = i + 1)
+            $fdisplay(fout, "%h", gold_mem[pp*64 + i]);
+    end
+    $fclose(fin);
+    $fclose(fout);
+    $display("--------------------------------------------------------------");
+    $display("  %0d patterns written to", `PATTERN_NUMBER);
+    $display("    %0s", `INPUT_FILE);
+    $display("    %0s", `OUTPUT_FILE);
+    $display("--------------------------------------------------------------");
+    $finish;
+end
+
+`else
+//#############################################################################
+//  NORMAL MODE : read input.txt / output.txt, drive the DUT and compare
+//#############################################################################
+reg [31:0] in_mem  [0:`PATTERN_NUMBER*208-1];     // per pattern: 64 x (K,Q,V), then 16 x out_weight
+reg [31:0] out_mem [0:`PATTERN_NUMBER*64-1];      // per pattern: 64 expected outputs
+
+//-----------------------------------------------------------------------------
 // Failure / success
-//=============================================================================
+//-----------------------------------------------------------------------------
 task fail_task;
     input [8*60-1:0] msg;
     begin
@@ -399,9 +463,9 @@ task pass_task;
     end
 endtask
 
-//=============================================================================
+//-----------------------------------------------------------------------------
 // Output idle monitor: out must be 0 while out_valid is low
-//=============================================================================
+//-----------------------------------------------------------------------------
 always @(negedge clk) begin
     if (chk_en) begin
         if (^{out_valid} === 1'bx)
@@ -411,19 +475,9 @@ always @(negedge clk) begin
     end
 end
 
-//=============================================================================
+//-----------------------------------------------------------------------------
 // Tasks
-//=============================================================================
-task drive_idle;
-    begin
-        in_valid   = 1'b0;
-        Q          = 32'bx;
-        K          = 32'bx;
-        V          = 32'bx;
-        out_weight = 32'bx;
-    end
-endtask
-
+//-----------------------------------------------------------------------------
 // asynchronous reset: asserted / released while the clock is held low
 task reset_task;
     begin
@@ -450,10 +504,10 @@ task input_task;
         for (i = 0; i < 64; i = i + 1) begin
             if (out_valid !== 1'b0) fail_task("out_valid overlaps with in_valid");
             in_valid = 1'b1;
-            Q = q_mem[pat*64 + i];
-            K = k_mem[pat*64 + i];
-            V = v_mem[pat*64 + i];
-            out_weight = (i < 16) ? w_mem[pat*16 + i] : 32'bx;
+            K = in_mem[pat*208 + i*3];
+            Q = in_mem[pat*208 + i*3 + 1];
+            V = in_mem[pat*208 + i*3 + 2];
+            out_weight = (i < 16) ? in_mem[pat*208 + 192 + i] : 32'bx;
             @(negedge clk);
         end
         drive_idle;                 // in_valid falls at this negative edge
@@ -481,12 +535,12 @@ task check_out_task;
             if (^out === 1'bx)       fail_task("out contains X");
             if (out[30:23] == 8'hff) fail_task("out is Inf / NaN");
             out_r  = f32_to_real(out);
-            gold_r = f32_to_real(gold_mem[pat*64 + i]);
+            gold_r = f32_to_real(out_mem[pat*64 + i]);
             cur_err = fabs(out_r - gold_r);
             if (cur_err > max_err) max_err = cur_err;
             if (cur_err >= `ERR_TOL) begin
                 $display("  output %0d : out = %h (%e)   golden = %h (%e)   err = %e",
-                         i, out, out_r, gold_mem[pat*64 + i], gold_r, cur_err);
+                         i, out, out_r, out_mem[pat*64 + i], gold_r, cur_err);
                 fail_task("output error is larger than the tolerance");
             end
             @(negedge clk);
@@ -497,27 +551,31 @@ task check_out_task;
     end
 endtask
 
-//=============================================================================
+//-----------------------------------------------------------------------------
 // Main
-//=============================================================================
+//-----------------------------------------------------------------------------
 initial begin
-    force clk = 1'b0;                 // clock stays idle while the data is prepared
+    force clk = 1'b0;
     rst_n  = 1'b1;
     chk_en = 1'b0;
     drive_idle;
+    pat = 0;
+
+    $readmemh(`INPUT_FILE,  in_mem);
+    $readmemh(`OUTPUT_FILE, out_mem);
+    if (^in_mem[`PATTERN_NUMBER*208 - 1] === 1'bx || ^out_mem[`PATTERN_NUMBER*64 - 1] === 1'bx) begin
+        $display("--------------------------------------------------------------");
+        $display("  FAIL  input.txt / output.txt are missing or hold fewer than %0d patterns", `PATTERN_NUMBER);
+        $display("        generate them once with +define+GEN_DATA");
+        $display("--------------------------------------------------------------");
+        $finish;
+    end
 
     seed = `SEED_NUMBER;
     total_lat = 0;
     max_lat = 0;
     max_err = 0.0;
 
-    for (pat = 0; pat < `PATTERN_NUMBER; pat = pat + 1) begin
-        gen_task(pat);
-        golden_task(pat);
-        if ((pat % 100) == 99) $display("  [PATTERN] %0d / %0d patterns prepared", pat + 1, `PATTERN_NUMBER);
-    end
-
-    pat = 0;
     reset_task;
     @(negedge clk);
 
@@ -530,5 +588,7 @@ initial begin
     end
     pass_task;
 end
+
+`endif
 
 endmodule
