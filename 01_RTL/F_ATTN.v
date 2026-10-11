@@ -3,22 +3,32 @@
 //   File Name   : F_ATTN.v
 //   Module Name : F_ATTN
 //
-//   Architecture (area-reduced version: 3 exp units, 2-stage output pipeline):
-//     * K,Q,V (64 words each) and out_weight (16 words) are stored while in_valid is high.
-//     * Loop order: head (2) -> Q block (8) -> K/V block (8); one 2x2 tile per 7 cycles
-//         T1 : prod = q*k (8 mult), s_raw = prod0 + prod1 (4 add)
-//         T2 : s = s_raw / sqrt2                  (4 div)
-//         T3 : rowmax, m_new = max(m, rowmax)     (4 cmp)
-//              dm = m - m_new, ds = s - m_new     (6 add with negated operand)
-//         E1 : alpha0 = exp(dm0), alpha1 = exp(dm1), p00 = exp(ds00)   (3 exp, alpha = 0 on the first tile)
-//         E2 : p01, p10, p11 = exp(ds01), exp(ds10), exp(ds11)         (the same 3 exp units)
-//         T5 : pv = p0*v0 + p1*v1 (8 mult, 4 add), psum = p0 + p1 (2 add)
-//         T6 : acc = alpha*acc + pv, l = alpha*l + psum (6 mult, 6 add)
-//       after the 8th K/V block:  FIN : head_out = acc / l (4 div)
-//     * OUT : every cycle one result  ((h0*w0 + h1*w1) + h2*w2) + h3*w3 , 64 cycles,
-//             2-stage pipeline: O1 = 4 mult + (p0+p1), O2 = (+p2) + p3
-//   The same floating point units are shared between the states (operand muxes below).
-//   Operation order matches 00_TESTBED/gen_pattern.py (online_f32).
+//   Architecture : compute while receiving, one pipelined row engine shared by both heads
+//
+//   * K,Q,V (64 words each) and out_weight (16 words) are stored while in_valid is high.
+//   * Block b (tokens 2b,2b+1) is complete after 8(b+1) input beats.  As soon as it is
+//     complete, every tile that needs it is issued:
+//         phase b :  tiles (i, j=b) for i = 0..b-1   (one more K/V block for the older chains)
+//                    tiles (i=b, j) for j = 0..b     (new Q block against all arrived K/V blocks)
+//     so for every (head, Q block) chain the K/V blocks are still visited in the order
+//     j = 0..7 (same rounding as the reference model).
+//   * A tile is issued as two row-tasks (row 0, row 1) per head, heads alternate:
+//         (hd0,r0) (hd0,r1) (hd1,r0) (hd1,r1)   -> 1 row-task per cycle, same chain every >=4 cycles
+//   * Row-task pipeline (every stage has its own units, no operand muxes):
+//         F1 : prod = q*k (4 mult), s_raw = prod0 + prod1 (2 add)
+//         F2 : s = s_raw / sqrt2                      (2 div)
+//         R1 : rmax, m_new = max(m, rmax)             (2 cmp)   m state read / written here
+//              ds = s - m_new, dm = m - m_new         (3 add, negated operand)
+//         R2 : alpha = exp(dm) (0 on the first tile), p = exp(ds)   (3 exp)
+//         R3 : alpha*acc, alpha*l (3 mult), pv = p0*v0 + p1*v1 (4 mult, 2 add), psum = p0 + p1 (1 add)
+//         R4 : acc = alpha*acc + pv, l = alpha*l + psum (3 add)     acc / l state written here
+//     State per (head, Q block, row): m, l, acc[2]  (32 + 32 + 64 words).
+//   * Output engine (dedicated units, overlaps the last tiles):
+//         for every token: head_out = acc / l (4 divides, one per cycle, prepared one token ahead)
+//         O1 : 4 mult + (p0 + p1)       O2 : (+p2) + p3      -> out, 1 word per cycle, 64 cycles
+//     It starts a fixed number of cycles after phase 7 starts issuing (P7_DLY); the schedule is
+//     data independent, so this is exact (P7_DLY-1 produces wrong results).
+//   Operation order matches 00_TESTBED/PATTERN.v (golden) and gen_pattern.py (online_f32).
 //############################################################################
 
 module F_ATTN(
@@ -39,84 +49,33 @@ output reg        out_valid;
 output reg [31:0] out;
 
 //---------------------------------------------------------------------
-//  parameters
+//  parameters / helper macros
 //---------------------------------------------------------------------
-parameter SIG_W  = 23;
-parameter EXP_W  = 8;
-parameter IEEE_C = 0;
+parameter SIG_W    = 23;
+parameter EXP_W    = 8;
+parameter IEEE_C   = 0;
+parameter EXP_ARCH = 0;
+parameter P7_DLY   = 4;     // output start = first phase-7 issue + 2 + P7_DLY cycles
 
 localparam [31:0] SQRT2 = 32'h3FB504F3;     // sqrt(2), constant given in the lab PDF
 localparam [31:0] FP0   = 32'h00000000;
 
-localparam [3:0] S_LOAD = 4'd0,
-                 S_T1   = 4'd1,
-                 S_T2   = 4'd2,
-                 S_T3   = 4'd3,
-                 S_E1   = 4'd4,
-                 S_E2   = 4'd5,
-                 S_T5   = 4'd6,
-                 S_T6   = 4'd7,
-                 S_FIN  = 4'd8,
-                 S_OUT  = 4'd9,
-                 S_FLUSH= 4'd10,
-                 S_DONE = 4'd11;
-
-//---------------------------------------------------------------------
-//  registers
-//---------------------------------------------------------------------
-reg [3:0]  st;
-reg [5:0]  cnt;
-reg [2:0]  bj, bi;          // K/V block index, Q block index
-reg        hd;              // head index
-
-reg [31:0] q_r  [0:63];
-reg [31:0] k_r  [0:63];
-reg [31:0] v_r  [0:63];
-reg [31:0] w_r  [0:15];
-reg [31:0] ho_r [0:63];     // head outputs, 16 tokens x 4 dims
-
-reg [31:0] sr00, sr01, sr10, sr11;          // raw scores
-reg [31:0] s00,  s01,  s10,  s11;           // scaled scores
-reg [31:0] ds00, ds01, ds10, ds11;          // s - m_new
-reg [31:0] dm0,  dm1;                       // m_old - m_new
-reg [31:0] p00,  p01,  p10,  p11;           // exp(s - m_new)
-reg [31:0] al0,  al1;                       // alpha
-reg [31:0] pv00, pv01, pv10, pv11;          // P x V tile
-reg [31:0] ps0,  ps1;                       // row sums of P
-reg [31:0] ac00, ac01, ac10, ac11;          // O accumulator
-reg [31:0] ll0,  ll1;                       // softmax denominator
-reg [31:0] mx0,  mx1;                       // running max
-reg [31:0] ra01, rp2, rp3;                  // output pipeline registers
-
-wire first = (bj == 3'd0);
-
-//---------------------------------------------------------------------
-//  operand reads
-//---------------------------------------------------------------------
-wire [31:0] qr0k0 = q_r[{bi, 1'b0, hd, 1'b0}];
-wire [31:0] qr0k1 = q_r[{bi, 1'b0, hd, 1'b1}];
-wire [31:0] qr1k0 = q_r[{bi, 1'b1, hd, 1'b0}];
-wire [31:0] qr1k1 = q_r[{bi, 1'b1, hd, 1'b1}];
-
-wire [31:0] kc0k0 = k_r[{bj, 1'b0, hd, 1'b0}];
-wire [31:0] kc0k1 = k_r[{bj, 1'b0, hd, 1'b1}];
-wire [31:0] kc1k0 = k_r[{bj, 1'b1, hd, 1'b0}];
-wire [31:0] kc1k1 = k_r[{bj, 1'b1, hd, 1'b1}];
-
-wire [31:0] vc0d0 = v_r[{bj, 1'b0, hd, 1'b0}];
-wire [31:0] vc0d1 = v_r[{bj, 1'b0, hd, 1'b1}];
-wire [31:0] vc1d0 = v_r[{bj, 1'b1, hd, 1'b0}];
-wire [31:0] vc1d1 = v_r[{bj, 1'b1, hd, 1'b1}];
-
-// output projection operands: token = cnt[5:2], out column = cnt[1:0]
-wire [31:0] hk0 = ho_r[{cnt[5:2], 2'd0}];
-wire [31:0] hk1 = ho_r[{cnt[5:2], 2'd1}];
-wire [31:0] hk2 = ho_r[{cnt[5:2], 2'd2}];
-wire [31:0] hk3 = ho_r[{cnt[5:2], 2'd3}];
-wire [31:0] wk0 = w_r[{cnt[1:0], 2'd0}];
-wire [31:0] wk1 = w_r[{cnt[1:0], 2'd1}];
-wire [31:0] wk2 = w_r[{cnt[1:0], 2'd2}];
-wire [31:0] wk3 = w_r[{cnt[1:0], 2'd3}];
+`define FA_MUL(U_, A_, B_, Z_) \
+    DW_fp_mult #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C)) \
+        U_ (.a(A_), .b(B_), .rnd(3'b000), .z(Z_), .status());
+`define FA_ADD(U_, A_, B_, Z_) \
+    DW_fp_add #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C)) \
+        U_ (.a(A_), .b(B_), .rnd(3'b000), .z(Z_), .status());
+`define FA_DIV(U_, A_, B_, Z_) \
+    DW_fp_div #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C)) \
+        U_ (.a(A_), .b(B_), .rnd(3'b000), .z(Z_), .status());
+`define FA_EXP(U_, A_, Z_) \
+    DW_fp_exp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C), .arch(EXP_ARCH)) \
+        U_ (.a(A_), .z(Z_), .status());
+`define FA_GT(U_, A_, B_, G_) \
+    DW_fp_cmp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C)) \
+        U_ (.a(A_), .b(B_), .zctr(1'b0), .aeqb(), .altb(), .agtb(G_), .unordered(), \
+            .z0(), .z1(), .status0(), .status1());
 
 function [31:0] neg;
     input [31:0] x;
@@ -126,294 +85,326 @@ function [31:0] neg;
 endfunction
 
 //---------------------------------------------------------------------
-//  floating point units (shared between states)
+//  input storage
 //---------------------------------------------------------------------
-reg  [31:0] mua [0:7];
-reg  [31:0] mub [0:7];
-wire [31:0] muz [0:7];
+reg [31:0] q_r [0:63];
+reg [31:0] k_r [0:63];
+reg [31:0] v_r [0:63];
+reg [31:0] w_r [0:15];
 
-reg  [31:0] ada [0:5];
-reg  [31:0] adb [0:5];
-wire [31:0] adz [0:5];
+reg [6:0]  ld_cnt;                      // input beats stored so far (0..64)
 
-reg  [31:0] dva [0:3];
-reg  [31:0] dvb [0:3];
-wire [31:0] dvz [0:3];
-
-reg  [31:0] exa [0:2];
-wire [31:0] exz [0:2];
-
-wire [31:0] cma [0:3];
-wire [31:0] cmb [0:3];
-wire        cmg [0:3];
-
-genvar g;
-generate
-    for (g = 0; g < 8; g = g + 1) begin : G_MUL
-        DW_fp_mult #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
-            u_mul (.a(mua[g]), .b(mub[g]), .rnd(3'b000), .z(muz[g]), .status());
+always @(posedge clk) begin
+    if (in_valid) begin
+        q_r[ld_cnt[5:0]] <= Q;
+        k_r[ld_cnt[5:0]] <= K;
+        v_r[ld_cnt[5:0]] <= V;
+        if (ld_cnt < 7'd16) w_r[ld_cnt[3:0]] <= out_weight;
     end
-    for (g = 0; g < 6; g = g + 1) begin : G_ADD
-        DW_fp_add #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
-            u_add (.a(ada[g]), .b(adb[g]), .rnd(3'b000), .z(adz[g]), .status());
-    end
-    for (g = 0; g < 4; g = g + 1) begin : G_DIV
-        DW_fp_div #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
-            u_div (.a(dva[g]), .b(dvb[g]), .rnd(3'b000), .z(dvz[g]), .status());
-    end
-    for (g = 0; g < 3; g = g + 1) begin : G_EXP
-        DW_fp_exp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
-            u_exp (.a(exa[g]), .z(exz[g]), .status());
-    end
-    for (g = 0; g < 4; g = g + 1) begin : G_CMP
-        DW_fp_cmp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
-            u_cmp (.a(cma[g]), .b(cmb[g]), .zctr(1'b0), .aeqb(), .altb(), .agtb(cmg[g]),
-                   .unordered(), .z0(), .z1(), .status0(), .status1());
-    end
-endgenerate
-
-//---------------------------------------------------------------------
-//  max tracking (T3): rowmax then running max, chained compares
-//---------------------------------------------------------------------
-assign cma[0] = s01;    assign cmb[0] = s00;       // s01 > s00 ?
-assign cma[1] = s11;    assign cmb[1] = s10;
-wire [31:0] rmax0 = cmg[0] ? s01 : s00;
-wire [31:0] rmax1 = cmg[1] ? s11 : s10;
-assign cma[2] = rmax0;  assign cmb[2] = mx0;       // rmax > m_old ?
-assign cma[3] = rmax1;  assign cmb[3] = mx1;
-wire [31:0] mnew0 = first ? rmax0 : (cmg[2] ? rmax0 : mx0);
-wire [31:0] mnew1 = first ? rmax1 : (cmg[3] ? rmax1 : mx1);
-
-//---------------------------------------------------------------------
-//  operand muxes
-//---------------------------------------------------------------------
-integer n;
-always @(*) begin
-    for (n = 0; n < 8; n = n + 1) begin
-        mua[n] = FP0;
-        mub[n] = FP0;
-    end
-    for (n = 0; n < 6; n = n + 1) begin
-        ada[n] = FP0;
-        adb[n] = FP0;
-    end
-    for (n = 0; n < 4; n = n + 1) begin
-        dva[n] = FP0;
-        dvb[n] = FP0;
-    end
-    for (n = 0; n < 3; n = n + 1) exa[n] = FP0;
-
-    case (st)
-    S_T1: begin
-        // prod[r][c][k] = q[r][k] * k[c][k]
-        mua[0] = qr0k0; mub[0] = kc0k0;     mua[1] = qr0k1; mub[1] = kc0k1;
-        mua[2] = qr0k0; mub[2] = kc1k0;     mua[3] = qr0k1; mub[3] = kc1k1;
-        mua[4] = qr1k0; mub[4] = kc0k0;     mua[5] = qr1k1; mub[5] = kc0k1;
-        mua[6] = qr1k0; mub[6] = kc1k0;     mua[7] = qr1k1; mub[7] = kc1k1;
-        ada[0] = muz[0]; adb[0] = muz[1];
-        ada[1] = muz[2]; adb[1] = muz[3];
-        ada[2] = muz[4]; adb[2] = muz[5];
-        ada[3] = muz[6]; adb[3] = muz[7];
-    end
-    S_T2: begin
-        dva[0] = sr00; dvb[0] = SQRT2;
-        dva[1] = sr01; dvb[1] = SQRT2;
-        dva[2] = sr10; dvb[2] = SQRT2;
-        dva[3] = sr11; dvb[3] = SQRT2;
-    end
-    S_T3: begin
-        ada[0] = s00; adb[0] = neg(mnew0);
-        ada[1] = s01; adb[1] = neg(mnew0);
-        ada[2] = s10; adb[2] = neg(mnew1);
-        ada[3] = s11; adb[3] = neg(mnew1);
-        ada[4] = mx0; adb[4] = neg(mnew0);
-        ada[5] = mx1; adb[5] = neg(mnew1);
-    end
-    S_E1: begin
-        exa[0] = dm0;  exa[1] = dm1;  exa[2] = ds00;
-    end
-    S_E2: begin
-        exa[0] = ds01; exa[1] = ds10; exa[2] = ds11;
-    end
-    S_T5: begin
-        // pv[r][d] = p[r][0]*v[0][d] + p[r][1]*v[1][d]
-        mua[0] = p00; mub[0] = vc0d0;       mua[1] = p01; mub[1] = vc1d0;
-        mua[2] = p00; mub[2] = vc0d1;       mua[3] = p01; mub[3] = vc1d1;
-        mua[4] = p10; mub[4] = vc0d0;       mua[5] = p11; mub[5] = vc1d0;
-        mua[6] = p10; mub[6] = vc0d1;       mua[7] = p11; mub[7] = vc1d1;
-        ada[0] = muz[0]; adb[0] = muz[1];
-        ada[1] = muz[2]; adb[1] = muz[3];
-        ada[2] = muz[4]; adb[2] = muz[5];
-        ada[3] = muz[6]; adb[3] = muz[7];
-        ada[4] = p00;    adb[4] = p01;
-        ada[5] = p10;    adb[5] = p11;
-    end
-    S_T6: begin
-        mua[0] = al0; mub[0] = ac00;
-        mua[1] = al0; mub[1] = ac01;
-        mua[2] = al1; mub[2] = ac10;
-        mua[3] = al1; mub[3] = ac11;
-        mua[4] = al0; mub[4] = ll0;
-        mua[5] = al1; mub[5] = ll1;
-        ada[0] = muz[0]; adb[0] = pv00;
-        ada[1] = muz[1]; adb[1] = pv01;
-        ada[2] = muz[2]; adb[2] = pv10;
-        ada[3] = muz[3]; adb[3] = pv11;
-        ada[4] = muz[4]; adb[4] = ps0;
-        ada[5] = muz[5]; adb[5] = ps1;
-    end
-    S_FIN: begin
-        dva[0] = ac00; dvb[0] = ll0;
-        dva[1] = ac01; dvb[1] = ll0;
-        dva[2] = ac10; dvb[2] = ll1;
-        dva[3] = ac11; dvb[3] = ll1;
-    end
-    S_OUT: begin
-        mua[0] = hk0; mub[0] = wk0;
-        mua[1] = hk1; mub[1] = wk1;
-        mua[2] = hk2; mub[2] = wk2;
-        mua[3] = hk3; mub[3] = wk3;
-        ada[0] = muz[0]; adb[0] = muz[1];
-        ada[1] = ra01;   adb[1] = rp2;
-        ada[2] = adz[1]; adb[2] = rp3;
-    end
-    S_FLUSH: begin
-        ada[1] = ra01;   adb[1] = rp2;
-        ada[2] = adz[1]; adb[2] = rp3;
-    end
-    default: ;
-    endcase
 end
 
 //---------------------------------------------------------------------
-//  control (asynchronous active-low reset)
+//  state of every (head, Q block, row) chain : index = {hd, i, r}
 //---------------------------------------------------------------------
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        st        <= S_LOAD;
-        cnt       <= 6'd0;
-        bj        <= 3'd0;
-        bi        <= 3'd0;
-        hd        <= 1'b0;
-        out_valid <= 1'b0;
-        out       <= 32'd0;
-        ac00 <= FP0; ac01 <= FP0; ac10 <= FP0; ac11 <= FP0;
-        ll0  <= FP0; ll1  <= FP0;
+reg [31:0] m_arr   [0:31];
+reg [31:0] l_arr   [0:31];
+reg [31:0] acc_arr [0:63];              // index {hd, i, r, d}
+
+//---------------------------------------------------------------------
+//  tile sequencer
+//---------------------------------------------------------------------
+reg [2:0] sb;                           // phase = newest arrived block
+reg [3:0] sidx;                         // position inside the phase (0..2b)
+reg       shd;                          // head
+reg       sq_r;                         // row
+reg       sdone;
+
+wire       col   = (sidx < {1'b0, sb});             // column tile: (i = idx, j = b)
+wire [2:0] ti    = col ? sidx[2:0] : sb;
+wire [3:0] rdiff = sidx - {1'b0, sb};
+wire [2:0] tj    = col ? sb : rdiff[2:0];
+wire       issue = !sdone && (ld_cnt >= {(sb == 3'd7), (sb + 3'd1) & 3'b111, 3'b000});
+
+//---------------------------------------------------------------------
+//  F1 : q*k, add
+//---------------------------------------------------------------------
+wire [31:0] q0  = q_r[{ti, sq_r, shd, 1'b0}];
+wire [31:0] q1  = q_r[{ti, sq_r, shd, 1'b1}];
+wire [31:0] k00 = k_r[{tj, 1'b0, shd, 1'b0}];
+wire [31:0] k01 = k_r[{tj, 1'b0, shd, 1'b1}];
+wire [31:0] k10 = k_r[{tj, 1'b1, shd, 1'b0}];
+wire [31:0] k11 = k_r[{tj, 1'b1, shd, 1'b1}];
+
+wire [31:0] f1_p00, f1_p01, f1_p10, f1_p11, f1_s0, f1_s1;
+`FA_MUL(u_f1_m00, q0, k00, f1_p00)
+`FA_MUL(u_f1_m01, q1, k01, f1_p01)
+`FA_MUL(u_f1_m10, q0, k10, f1_p10)
+`FA_MUL(u_f1_m11, q1, k11, f1_p11)
+`FA_ADD(u_f1_a0, f1_p00, f1_p01, f1_s0)
+`FA_ADD(u_f1_a1, f1_p10, f1_p11, f1_s1)
+
+// pipeline control: valid bit and tag {hd, i, r, j} per stage
+reg        va, vb, vc, vd, ve;
+reg [7:0]  ta, tb, tc, td, te;
+
+reg [31:0] sc0, sc1;                    // after F1
+reg [31:0] s0,  s1;                     // after F2
+reg [31:0] ds0, ds1, dm;                // after R1
+reg [31:0] pe0, pe1, al;                // after R2
+reg [31:0] am0, am1, lm, pv0, pv1, ps;  // after R3
+
+//---------------------------------------------------------------------
+//  F2 : divide by sqrt2
+//---------------------------------------------------------------------
+wire [31:0] f2_s0, f2_s1;
+`FA_DIV(u_f2_d0, sc0, SQRT2, f2_s0)
+`FA_DIV(u_f2_d1, sc1, SQRT2, f2_s1)
+
+//---------------------------------------------------------------------
+//  R1 : running max, subtract
+//---------------------------------------------------------------------
+wire        first_b = (tb[2:0] == 3'd0);
+wire [31:0] m_rd    = m_arr[tb[7:3]];
+wire        g_a, g_b;
+`FA_GT(u_r1_ca, s1, s0, g_a)
+wire [31:0] rmax = g_a ? s1 : s0;
+`FA_GT(u_r1_cb, rmax, m_rd, g_b)
+wire [31:0] mnew = (first_b | g_b) ? rmax : m_rd;
+wire [31:0] nmn  = neg(mnew);
+wire [31:0] r1_ds0, r1_ds1, r1_dm;
+`FA_ADD(u_r1_a0, s0,   nmn, r1_ds0)
+`FA_ADD(u_r1_a1, s1,   nmn, r1_ds1)
+`FA_ADD(u_r1_a2, m_rd, nmn, r1_dm)
+
+//---------------------------------------------------------------------
+//  R2 : exp
+//---------------------------------------------------------------------
+wire        first_c = (tc[2:0] == 3'd0);
+wire [31:0] r2_al, r2_p0, r2_p1;
+`FA_EXP(u_r2_e0, dm,  r2_al)
+`FA_EXP(u_r2_e1, ds0, r2_p0)
+`FA_EXP(u_r2_e2, ds1, r2_p1)
+
+//---------------------------------------------------------------------
+//  R3 : alpha*state, p*v
+//---------------------------------------------------------------------
+wire        first_d = (td[2:0] == 3'd0);
+wire [31:0] ag0 = first_d ? FP0 : acc_arr[{td[7:3], 1'b0}];
+wire [31:0] ag1 = first_d ? FP0 : acc_arr[{td[7:3], 1'b1}];
+wire [31:0] lg  = first_d ? FP0 : l_arr[td[7:3]];
+
+wire [31:0] v00 = v_r[{td[2:0], 1'b0, td[7], 1'b0}];    // v[c=0][d=0]
+wire [31:0] v01 = v_r[{td[2:0], 1'b0, td[7], 1'b1}];    // v[c=0][d=1]
+wire [31:0] v10 = v_r[{td[2:0], 1'b1, td[7], 1'b0}];    // v[c=1][d=0]
+wire [31:0] v11 = v_r[{td[2:0], 1'b1, td[7], 1'b1}];    // v[c=1][d=1]
+
+wire [31:0] r3_am0, r3_am1, r3_lm, r3_pa, r3_pb, r3_pc, r3_pd, r3_pv0, r3_pv1, r3_ps;
+`FA_MUL(u_r3_m0, al,  ag0, r3_am0)
+`FA_MUL(u_r3_m1, al,  ag1, r3_am1)
+`FA_MUL(u_r3_m2, al,  lg,  r3_lm)
+`FA_MUL(u_r3_m3, pe0, v00, r3_pa)
+`FA_MUL(u_r3_m4, pe1, v10, r3_pb)
+`FA_MUL(u_r3_m5, pe0, v01, r3_pc)
+`FA_MUL(u_r3_m6, pe1, v11, r3_pd)
+`FA_ADD(u_r3_a0, r3_pa, r3_pb, r3_pv0)
+`FA_ADD(u_r3_a1, r3_pc, r3_pd, r3_pv1)
+`FA_ADD(u_r3_a2, pe0,   pe1,   r3_ps)
+
+//---------------------------------------------------------------------
+//  R4 : state update
+//---------------------------------------------------------------------
+wire [31:0] r4_acc0, r4_acc1, r4_l;
+`FA_ADD(u_r4_a0, am0, pv0, r4_acc0)
+`FA_ADD(u_r4_a1, am1, pv1, r4_acc1)
+`FA_ADD(u_r4_a2, lm,  ps,  r4_l)
+
+always @(posedge clk) begin
+    // data registers: no enable, garbage while the stage is empty
+    sc0 <= f1_s0;  sc1 <= f1_s1;
+    s0  <= f2_s0;  s1  <= f2_s1;
+    ds0 <= r1_ds0; ds1 <= r1_ds1;  dm <= first_b ? FP0 : r1_dm;
+    pe0 <= r2_p0;  pe1 <= r2_p1;   al <= first_c ? FP0 : r2_al;
+    am0 <= r3_am0; am1 <= r3_am1;  lm <= r3_lm;
+    pv0 <= r3_pv0; pv1 <= r3_pv1;  ps <= r3_ps;
+
+    ta <= {shd, ti, sq_r, tj};
+    tb <= ta;
+    tc <= tb;
+    td <= tc;
+    te <= td;
+
+    // state arrays
+    if (vb) m_arr[tb[7:3]] <= mnew;
+    if (ve) begin
+        acc_arr[{te[7:3], 1'b0}] <= r4_acc0;
+        acc_arr[{te[7:3], 1'b1}] <= r4_acc1;
+        l_arr[te[7:3]]           <= r4_l;
     end
-    else begin
-        case (st)
-        S_LOAD: begin
-            if (in_valid) begin
-                cnt <= cnt + 6'd1;
-                if (cnt == 6'd63) begin
-                    cnt <= 6'd0;
-                    bj  <= 3'd0;
-                    bi  <= 3'd0;
-                    hd  <= 1'b0;
-                    st  <= S_T1;
-                end
-            end
+end
+
+//---------------------------------------------------------------------
+//  output engine
+//---------------------------------------------------------------------
+localparam [2:0] O_IDLE  = 3'd0,
+                 O_PREP  = 3'd1,
+                 O_RUN   = 3'd2,
+                 O_FLUSH = 3'd3,
+                 O_DONE  = 3'd4;
+
+reg [2:0]  ost;
+reg [1:0]  pc;                          // prepare counter (start-up only)
+reg [5:0]  oc;                          // output word counter
+reg        p7_on;
+reg [3:0]  p7c;
+reg        ov2;
+
+reg [31:0] ho0, ho1, ho2, ho3;          // head outputs of the token being projected
+reg [31:0] hn0, hn1, hn2;               // next token, being prepared
+reg [31:0] ra01, rp2, rp3;
+
+wire [1:0] pcur = (ost == O_PREP) ? pc : oc[1:0];
+wire [3:0] tp   = (ost == O_PREP) ? 4'd0 : (oc[5:2] + 4'd1);
+wire [4:0] eo   = {pcur[1], tp};        // {hd, token}
+wire [31:0] o_acc = acc_arr[{eo, pcur[0]}];
+wire [31:0] o_l   = l_arr[eo];
+wire [31:0] o_dz;
+`FA_DIV(u_o_d, o_acc, o_l, o_dz)
+
+wire [31:0] wk0 = w_r[{oc[1:0], 2'd0}];
+wire [31:0] wk1 = w_r[{oc[1:0], 2'd1}];
+wire [31:0] wk2 = w_r[{oc[1:0], 2'd2}];
+wire [31:0] wk3 = w_r[{oc[1:0], 2'd3}];
+wire [31:0] o_m0, o_m1, o_m2, o_m3, o_a01, o_b, o_c;
+`FA_MUL(u_o_m0, ho0, wk0, o_m0)
+`FA_MUL(u_o_m1, ho1, wk1, o_m1)
+`FA_MUL(u_o_m2, ho2, wk2, o_m2)
+`FA_MUL(u_o_m3, ho3, wk3, o_m3)
+`FA_ADD(u_o_a0, o_m0, o_m1, o_a01)
+`FA_ADD(u_o_a1, ra01, rp2,  o_b)
+`FA_ADD(u_o_a2, o_b,  rp3,  o_c)
+
+always @(posedge clk) begin
+    ra01 <= o_a01;
+    rp2  <= o_m2;
+    rp3  <= o_m3;
+    if (ost == O_PREP || ost == O_RUN) begin
+        case (pcur)
+        2'd0: hn0 <= o_dz;
+        2'd1: hn1 <= o_dz;
+        2'd2: hn2 <= o_dz;
+        default: begin
+            ho0 <= hn0;
+            ho1 <= hn1;
+            ho2 <= hn2;
+            ho3 <= o_dz;
         end
-        S_T1: st <= S_T2;
-        S_T2: st <= S_T3;
-        S_T3: st <= S_E1;
-        S_E1: st <= S_E2;
-        S_E2: st <= S_T5;
-        S_T5: st <= S_T6;
-        S_T6: begin
-            ac00 <= adz[0]; ac01 <= adz[1]; ac10 <= adz[2]; ac11 <= adz[3];
-            ll0  <= adz[4]; ll1  <= adz[5];
-            if (bj == 3'd7) st <= S_FIN;
-            else begin
-                bj <= bj + 3'd1;
-                st <= S_T1;
-            end
-        end
-        S_FIN: begin
-            ac00 <= FP0; ac01 <= FP0; ac10 <= FP0; ac11 <= FP0;
-            ll0  <= FP0; ll1  <= FP0;
-            bj   <= 3'd0;
-            if ({hd, bi} == 4'b1111) begin
-                cnt <= 6'd0;
-                st  <= S_OUT;
-            end
-            else begin
-                {hd, bi} <= {hd, bi} + 4'd1;
-                st <= S_T1;
-            end
-        end
-        S_OUT: begin                    // stage O1 for index cnt, stage O2 for index cnt-1
-            out_valid <= (cnt != 6'd0);
-            out       <= (cnt != 6'd0) ? adz[2] : 32'd0;
-            cnt       <= cnt + 6'd1;
-            if (cnt == 6'd63) st <= S_FLUSH;
-        end
-        S_FLUSH: begin                  // stage O2 for the last index
-            out_valid <= 1'b1;
-            out       <= adz[2];
-            st        <= S_DONE;
-        end
-        S_DONE: begin
-            out_valid <= 1'b0;
-            out       <= 32'd0;
-            cnt       <= 6'd0;
-            st        <= S_LOAD;
-        end
-        default: st <= S_LOAD;
         endcase
     end
 end
 
 //---------------------------------------------------------------------
-//  datapath registers (no reset needed)
+//  control (asynchronous active-low reset)
 //---------------------------------------------------------------------
-always @(posedge clk) begin
-    if (st == S_LOAD && in_valid) begin
-        q_r[cnt] <= Q;
-        k_r[cnt] <= K;
-        v_r[cnt] <= V;
-        if (cnt < 6'd16) w_r[cnt[3:0]] <= out_weight;
-    end
+wire first_issue7 = issue && (sb == 3'd7) && (sidx == 4'd0) && !shd && !sq_r;
 
-    case (st)
-    S_T1: begin
-        sr00 <= adz[0]; sr01 <= adz[1]; sr10 <= adz[2]; sr11 <= adz[3];
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        ld_cnt    <= 7'd0;
+        sb        <= 3'd0;
+        sidx      <= 4'd0;
+        shd       <= 1'b0;
+        sq_r      <= 1'b0;
+        sdone     <= 1'b0;
+        va <= 1'b0; vb <= 1'b0; vc <= 1'b0; vd <= 1'b0; ve <= 1'b0;
+        p7_on     <= 1'b0;
+        p7c       <= 4'd0;
+        ost       <= O_IDLE;
+        pc        <= 2'd0;
+        oc        <= 6'd0;
+        ov2       <= 1'b0;
+        out_valid <= 1'b0;
+        out       <= 32'd0;
     end
-    S_T2: begin
-        s00 <= dvz[0]; s01 <= dvz[1]; s10 <= dvz[2]; s11 <= dvz[3];
+    else begin
+        if (in_valid) ld_cnt <= ld_cnt + 7'd1;
+
+        // pipeline valid bits
+        va <= issue;
+        vb <= va;
+        vc <= vb;
+        vd <= vc;
+        ve <= vd;
+
+        // tile sequencer
+        if (issue) begin
+            sq_r <= ~sq_r;
+            if (sq_r) begin
+                shd <= ~shd;
+                if (shd) begin
+                    if (sidx == {sb, 1'b0}) begin
+                        sidx <= 4'd0;
+                        if (sb == 3'd7) sdone <= 1'b1;
+                        else            sb <= sb + 3'd1;
+                    end
+                    else sidx <= sidx + 4'd1;
+                end
+            end
+        end
+
+        // output start trigger
+        if (first_issue7) begin
+            p7_on <= 1'b1;
+            p7c   <= 4'd0;
+        end
+        else if (p7_on) p7c <= p7c + 4'd1;
+
+        // output engine
+        ov2       <= (ost == O_RUN);
+        out_valid <= ov2;
+        out       <= ov2 ? o_c : 32'd0;
+
+        case (ost)
+        O_IDLE: begin
+            if (p7_on && p7c == P7_DLY) begin
+                ost   <= O_PREP;
+                pc    <= 2'd0;
+                p7_on <= 1'b0;
+            end
+        end
+        O_PREP: begin
+            pc <= pc + 2'd1;
+            if (pc == 2'd3) begin
+                ost <= O_RUN;
+                oc  <= 6'd0;
+            end
+        end
+        O_RUN: begin
+            oc <= oc + 6'd1;
+            if (oc == 6'd63) ost <= O_FLUSH;
+        end
+        O_FLUSH: ost <= O_DONE;
+        O_DONE: begin                   // clear for the next run
+            ost    <= O_IDLE;
+            ld_cnt <= 7'd0;
+            sb     <= 3'd0;
+            sidx   <= 4'd0;
+            shd    <= 1'b0;
+            sq_r   <= 1'b0;
+            sdone  <= 1'b0;
+            p7_on  <= 1'b0;
+            p7c    <= 4'd0;
+            pc     <= 2'd0;
+            oc     <= 6'd0;
+        end
+        default: ost <= O_IDLE;
+        endcase
     end
-    S_T3: begin
-        ds00 <= adz[0]; ds01 <= adz[1]; ds10 <= adz[2]; ds11 <= adz[3];
-        dm0  <= first ? FP0 : adz[4];
-        dm1  <= first ? FP0 : adz[5];
-        mx0  <= mnew0;
-        mx1  <= mnew1;
-    end
-    S_E1: begin
-        al0 <= first ? FP0 : exz[0];
-        al1 <= first ? FP0 : exz[1];
-        p00 <= exz[2];
-    end
-    S_E2: begin
-        p01 <= exz[0]; p10 <= exz[1]; p11 <= exz[2];
-    end
-    S_T5: begin
-        pv00 <= adz[0]; pv01 <= adz[1]; pv10 <= adz[2]; pv11 <= adz[3];
-        ps0  <= adz[4]; ps1  <= adz[5];
-    end
-    S_OUT: begin
-        ra01 <= adz[0];
-        rp2  <= muz[2];
-        rp3  <= muz[3];
-    end
-    S_FIN: begin
-        ho_r[{bi, 1'b0, hd, 1'b0}] <= dvz[0];
-        ho_r[{bi, 1'b0, hd, 1'b1}] <= dvz[1];
-        ho_r[{bi, 1'b1, hd, 1'b0}] <= dvz[2];
-        ho_r[{bi, 1'b1, hd, 1'b1}] <= dvz[3];
-    end
-    default: ;
-    endcase
 end
+
+`undef FA_MUL
+`undef FA_ADD
+`undef FA_DIV
+`undef FA_EXP
+`undef FA_GT
 
 endmodule
