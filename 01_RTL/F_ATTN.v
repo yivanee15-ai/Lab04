@@ -3,18 +3,20 @@
 //   File Name   : F_ATTN.v
 //   Module Name : F_ATTN
 //
-//   Architecture (first version, correctness first):
+//   Architecture (area-reduced version: 3 exp units, 2-stage output pipeline):
 //     * K,Q,V (64 words each) and out_weight (16 words) are stored while in_valid is high.
-//     * Loop order: head (2) -> Q block (8) -> K/V block (8); one 2x2 tile per 6 cycles
+//     * Loop order: head (2) -> Q block (8) -> K/V block (8); one 2x2 tile per 7 cycles
 //         T1 : prod = q*k (8 mult), s_raw = prod0 + prod1 (4 add)
 //         T2 : s = s_raw / sqrt2                  (4 div)
 //         T3 : rowmax, m_new = max(m, rowmax)     (4 cmp)
 //              dm = m - m_new, ds = s - m_new     (6 add with negated operand)
-//         T4 : alpha = exp(dm), p = exp(ds)       (6 exp)          alpha = 0 on the first tile
+//         E1 : alpha0 = exp(dm0), alpha1 = exp(dm1), p00 = exp(ds00)   (3 exp, alpha = 0 on the first tile)
+//         E2 : p01, p10, p11 = exp(ds01), exp(ds10), exp(ds11)         (the same 3 exp units)
 //         T5 : pv = p0*v0 + p1*v1 (8 mult, 4 add), psum = p0 + p1 (2 add)
 //         T6 : acc = alpha*acc + pv, l = alpha*l + psum (6 mult, 6 add)
 //       after the 8th K/V block:  FIN : head_out = acc / l (4 div)
-//     * OUT : every cycle one result  ((h0*w0 + h1*w1) + h2*w2) + h3*w3 , 64 cycles
+//     * OUT : every cycle one result  ((h0*w0 + h1*w1) + h2*w2) + h3*w3 , 64 cycles,
+//             2-stage pipeline: O1 = 4 mult + (p0+p1), O2 = (+p2) + p3
 //   The same floating point units are shared between the states (operand muxes below).
 //   Operation order matches 00_TESTBED/gen_pattern.py (online_f32).
 //############################################################################
@@ -50,12 +52,14 @@ localparam [3:0] S_LOAD = 4'd0,
                  S_T1   = 4'd1,
                  S_T2   = 4'd2,
                  S_T3   = 4'd3,
-                 S_T4   = 4'd4,
-                 S_T5   = 4'd5,
-                 S_T6   = 4'd6,
-                 S_FIN  = 4'd7,
-                 S_OUT  = 4'd8,
-                 S_DONE = 4'd9;
+                 S_E1   = 4'd4,
+                 S_E2   = 4'd5,
+                 S_T5   = 4'd6,
+                 S_T6   = 4'd7,
+                 S_FIN  = 4'd8,
+                 S_OUT  = 4'd9,
+                 S_FLUSH= 4'd10,
+                 S_DONE = 4'd11;
 
 //---------------------------------------------------------------------
 //  registers
@@ -82,6 +86,7 @@ reg [31:0] ps0,  ps1;                       // row sums of P
 reg [31:0] ac00, ac01, ac10, ac11;          // O accumulator
 reg [31:0] ll0,  ll1;                       // softmax denominator
 reg [31:0] mx0,  mx1;                       // running max
+reg [31:0] ra01, rp2, rp3;                  // output pipeline registers
 
 wire first = (bj == 3'd0);
 
@@ -135,8 +140,8 @@ reg  [31:0] dva [0:3];
 reg  [31:0] dvb [0:3];
 wire [31:0] dvz [0:3];
 
-wire [31:0] exa [0:5];
-wire [31:0] exz [0:5];
+reg  [31:0] exa [0:2];
+wire [31:0] exz [0:2];
 
 wire [31:0] cma [0:3];
 wire [31:0] cmb [0:3];
@@ -156,7 +161,7 @@ generate
         DW_fp_div #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
             u_div (.a(dva[g]), .b(dvb[g]), .rnd(3'b000), .z(dvz[g]), .status());
     end
-    for (g = 0; g < 6; g = g + 1) begin : G_EXP
+    for (g = 0; g < 3; g = g + 1) begin : G_EXP
         DW_fp_exp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C))
             u_exp (.a(exa[g]), .z(exz[g]), .status());
     end
@@ -179,14 +184,6 @@ assign cma[3] = rmax1;  assign cmb[3] = mx1;
 wire [31:0] mnew0 = first ? rmax0 : (cmg[2] ? rmax0 : mx0);
 wire [31:0] mnew1 = first ? rmax1 : (cmg[3] ? rmax1 : mx1);
 
-// exp inputs come straight from registers (T4)
-assign exa[0] = dm0;
-assign exa[1] = dm1;
-assign exa[2] = ds00;
-assign exa[3] = ds01;
-assign exa[4] = ds10;
-assign exa[5] = ds11;
-
 //---------------------------------------------------------------------
 //  operand muxes
 //---------------------------------------------------------------------
@@ -204,6 +201,7 @@ always @(*) begin
         dva[n] = FP0;
         dvb[n] = FP0;
     end
+    for (n = 0; n < 3; n = n + 1) exa[n] = FP0;
 
     case (st)
     S_T1: begin
@@ -230,6 +228,12 @@ always @(*) begin
         ada[3] = s11; adb[3] = neg(mnew1);
         ada[4] = mx0; adb[4] = neg(mnew0);
         ada[5] = mx1; adb[5] = neg(mnew1);
+    end
+    S_E1: begin
+        exa[0] = dm0;  exa[1] = dm1;  exa[2] = ds00;
+    end
+    S_E2: begin
+        exa[0] = ds01; exa[1] = ds10; exa[2] = ds11;
     end
     S_T5: begin
         // pv[r][d] = p[r][0]*v[0][d] + p[r][1]*v[1][d]
@@ -270,8 +274,12 @@ always @(*) begin
         mua[2] = hk2; mub[2] = wk2;
         mua[3] = hk3; mub[3] = wk3;
         ada[0] = muz[0]; adb[0] = muz[1];
-        ada[1] = adz[0]; adb[1] = muz[2];
-        ada[2] = adz[1]; adb[2] = muz[3];
+        ada[1] = ra01;   adb[1] = rp2;
+        ada[2] = adz[1]; adb[2] = rp3;
+    end
+    S_FLUSH: begin
+        ada[1] = ra01;   adb[1] = rp2;
+        ada[2] = adz[1]; adb[2] = rp3;
     end
     default: ;
     endcase
@@ -308,8 +316,9 @@ always @(posedge clk or negedge rst_n) begin
         end
         S_T1: st <= S_T2;
         S_T2: st <= S_T3;
-        S_T3: st <= S_T4;
-        S_T4: st <= S_T5;
+        S_T3: st <= S_E1;
+        S_E1: st <= S_E2;
+        S_E2: st <= S_T5;
         S_T5: st <= S_T6;
         S_T6: begin
             ac00 <= adz[0]; ac01 <= adz[1]; ac10 <= adz[2]; ac11 <= adz[3];
@@ -333,11 +342,16 @@ always @(posedge clk or negedge rst_n) begin
                 st <= S_T1;
             end
         end
-        S_OUT: begin
+        S_OUT: begin                    // stage O1 for index cnt, stage O2 for index cnt-1
+            out_valid <= (cnt != 6'd0);
+            out       <= (cnt != 6'd0) ? adz[2] : 32'd0;
+            cnt       <= cnt + 6'd1;
+            if (cnt == 6'd63) st <= S_FLUSH;
+        end
+        S_FLUSH: begin                  // stage O2 for the last index
             out_valid <= 1'b1;
             out       <= adz[2];
-            cnt       <= cnt + 6'd1;
-            if (cnt == 6'd63) st <= S_DONE;
+            st        <= S_DONE;
         end
         S_DONE: begin
             out_valid <= 1'b0;
@@ -375,14 +389,22 @@ always @(posedge clk) begin
         mx0  <= mnew0;
         mx1  <= mnew1;
     end
-    S_T4: begin
-        p00 <= exz[2]; p01 <= exz[3]; p10 <= exz[4]; p11 <= exz[5];
+    S_E1: begin
         al0 <= first ? FP0 : exz[0];
         al1 <= first ? FP0 : exz[1];
+        p00 <= exz[2];
+    end
+    S_E2: begin
+        p01 <= exz[0]; p10 <= exz[1]; p11 <= exz[2];
     end
     S_T5: begin
         pv00 <= adz[0]; pv01 <= adz[1]; pv10 <= adz[2]; pv11 <= adz[3];
         ps0  <= adz[4]; ps1  <= adz[5];
+    end
+    S_OUT: begin
+        ra01 <= adz[0];
+        rp2  <= muz[2];
+        rp3  <= muz[3];
     end
     S_FIN: begin
         ho_r[{bi, 1'b0, hd, 1'b0}] <= dvz[0];
