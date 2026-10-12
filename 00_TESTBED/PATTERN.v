@@ -8,6 +8,9 @@
 `define ERR_TOL         1.0e-7
 `define MAX_LATENCY     1000
 `define DIRECTED_NUM    13          // corner-case patterns before the random ones
+`ifndef GAP_MIN
+  `define GAP_MIN       1           // negative edges to wait after the first idle sample (1 -> in_valid at the 2nd edge)
+`endif
 
 // Two modes
 //   default          : read ../00_TESTBED/input.txt and output.txt, drive the DUT, compare
@@ -580,7 +583,9 @@ initial begin
     @(negedge clk);
 
     for (pat = 0; pat < `PATTERN_NUMBER; pat = pat + 1) begin
-        gap = 2 + ({$random(seed)} % 3);        // 2 ~ 4 negative edges
+        // spec Fig3: in_valid rises at the 2nd ~ 4th negative edge after out_valid fell.
+        // check_out_task ends at the 1st negative edge where out_valid is low, so wait 1 ~ 3 more.
+        gap = `GAP_MIN + ({$random(seed)} % 3);
         repeat (gap) @(negedge clk);
         input_task;
         wait_out_task;
