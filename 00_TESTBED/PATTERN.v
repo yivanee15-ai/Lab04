@@ -590,6 +590,7 @@ initial begin
         input_task;
         wait_out_task;
         check_out_task;
+        if ((pat % 50) == 49) $display("  [PATTERN] %0d / %0d patterns checked, max err so far %e", pat + 1, `PATTERN_NUMBER, max_err);
     end
     pass_task;
 end
