@@ -8,7 +8,7 @@
 `define ERR_TOL         1.0e-7
 `define MAX_LATENCY     1000
 `define DIRECTED_NUM    13          // corner-case patterns before the random ones
-// golden QK score: 2 mult + 1 add by default (matches F_ATTN QK_DP2 = 0); +define+GOLD_QK_DP2 for one DW_fp_dp2
+// golden QK score: one DW_fp_dp2 by default (matches F_ATTN QK_DP2 = 1); +define+GOLD_QK_SEP for 2 mult + 1 add
 `ifndef GAP_MIN
   `define GAP_MIN       1           // negative edges to wait after the first idle sample (1 -> in_valid at the 2nd edge)
 `endif
@@ -288,7 +288,7 @@ DW_fp_exp  #(inst_sig_width, inst_exp_width, inst_ieee_compliance, inst_arch)
 DW_fp_cmp  #(inst_sig_width, inst_exp_width, inst_ieee_compliance)
     G_CMP  (.a(gc_a), .b(gc_b), .zctr(1'b0), .aeqb(), .altb(), .agtb(gc_gt),
             .unordered(), .z0(), .z1(), .status0(), .status1());
-`ifdef GOLD_QK_DP2
+`ifndef GOLD_QK_SEP
 reg  [31:0] gp_a, gp_b, gp_c, gp_d;  wire [31:0] gp_z;
 DW_fp_dp2  #(inst_sig_width, inst_exp_width, inst_ieee_compliance, inst_arch_type)
     G_DP2  (.a(gp_a), .b(gp_b), .c(gp_c), .d(gp_d), .rnd(3'b000), .z(gp_z), .status());
@@ -341,7 +341,7 @@ task golden_task;
 `endif
                             x_k0 = k_mem[gb + (2*bj + c)*4 + 2*hh];
                             x_k1 = k_mem[gb + (2*bj + c)*4 + 2*hh + 1];
-`ifdef GOLD_QK_DP2
+`ifndef GOLD_QK_SEP
                             fdp2(x_q0, x_k0, x_q1, x_k1); x_c = t_z;     // one rounding
 `else
                             fmul(x_q0, x_k0); x_a = t_z;

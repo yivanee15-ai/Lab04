@@ -55,7 +55,7 @@ parameter SIG_W    = 23;
 parameter EXP_W    = 8;
 parameter IEEE_C   = 0;
 parameter EXP_ARCH = 0;
-parameter QK_DP2   = 0;     // 0: q0*k0 + q1*k1 with 2 mult + 1 add, 1: one DW_fp_dp2 (single rounding)
+parameter QK_DP2   = 1;     // 0: q0*k0 + q1*k1 with 2 mult + 1 add, 1: one DW_fp_dp2 (single rounding)
 parameter DP_ARCH  = 0;     // arch_type of DW_fp_dp2
 parameter W_T      = 0;     // 1: out_weight is delivered already transposed (Final = Concat x W)
 parameter Q_PRE    = 1;     // 1: Q is divided by sqrt2 as it arrives (matches TA golden), 0: S divided by sqrt2 after QK
