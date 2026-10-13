@@ -286,11 +286,10 @@ reg [1:0]  pc;                          // prepare counter (start-up only)
 reg [5:0]  oc;                          // output word counter
 reg        p7_on;
 reg [3:0]  p7c;
-reg        ov2;
+reg        ov1, ov2;
 
 reg [31:0] ho0, ho1, ho2, ho3;          // head outputs of the token being projected
 reg [31:0] hn0, hn1, hn2;               // next token, being prepared
-reg [31:0] ra01, rp2, rp3;
 
 wire [1:0] pcur = (ost == O_PREP) ? pc : oc[1:0];
 wire [3:0] tp   = (ost == O_PREP) ? 4'd0 : (oc[5:2] + 4'd1);
@@ -313,19 +312,23 @@ wire [31:0] wk0 = w_r[(W_T != 0) ? {2'd0, oc[1:0]} : {oc[1:0], 2'd0}];
 wire [31:0] wk1 = w_r[(W_T != 0) ? {2'd1, oc[1:0]} : {oc[1:0], 2'd1}];
 wire [31:0] wk2 = w_r[(W_T != 0) ? {2'd2, oc[1:0]} : {oc[1:0], 2'd2}];
 wire [31:0] wk3 = w_r[(W_T != 0) ? {2'd3, oc[1:0]} : {oc[1:0], 2'd3}];
-wire [31:0] o_m0, o_m1, o_m2, o_m3, o_a01, o_b, o_c;
+wire [31:0] o_m0, o_m1, o_m2, o_m3, o_a01, o_a23, o_c;
+reg  [31:0] rm0, rm1, rm2, rm3, ra01, ra23;
 `FA_MUL(u_o_m0, ho0, wk0, o_m0)
 `FA_MUL(u_o_m1, ho1, wk1, o_m1)
 `FA_MUL(u_o_m2, ho2, wk2, o_m2)
 `FA_MUL(u_o_m3, ho3, wk3, o_m3)
-`FA_ADD(u_o_a0, o_m0, o_m1, o_a01)
-`FA_ADD(u_o_a1, ra01, rp2,  o_b)
-`FA_ADD(u_o_a2, o_b,  rp3,  o_c)
+`FA_ADD(u_o_a0, rm0, rm1, o_a01)
+`FA_ADD(u_o_a1, rm2, rm3, o_a23)
+`FA_ADD(u_o_a2, ra01, ra23, o_c)
 
 always @(posedge clk) begin
-    ra01 <= o_a01;
-    rp2  <= o_m2;
-    rp3  <= o_m3;
+    rm0  <= o_m0;                       // stage 1 : four products
+    rm1  <= o_m1;
+    rm2  <= o_m2;
+    rm3  <= o_m3;
+    ra01 <= o_a01;                      // stage 2 : two partial sums
+    ra23 <= o_a23;
     if (ost == O_PREP || ost == O_RUN) begin
         case (pcur)
         2'd0: hn0 <= o_dz;
@@ -361,6 +364,7 @@ always @(posedge clk or negedge rst_n) begin
         ost       <= O_IDLE;
         pc        <= 2'd0;
         oc        <= 6'd0;
+        ov1       <= 1'b0;
         ov2       <= 1'b0;
         out_valid <= 1'b0;
         out       <= 32'd0;
@@ -400,7 +404,8 @@ always @(posedge clk or negedge rst_n) begin
         else if (p7_on) p7c <= p7c + 4'd1;
 
         // output engine
-        ov2       <= (ost == O_RUN);
+        ov1       <= (ost == O_RUN);
+        ov2       <= ov1;
         out_valid <= ov2;
         out       <= ov2 ? o_c : 32'd0;
 

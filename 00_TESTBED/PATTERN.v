@@ -406,7 +406,7 @@ task golden_task;
             end
         end
 
-        // concat x Out_weight^T : ((h0*w0 + h1*w1) + h2*w2) + h3*w3
+        // concat x Out_weight^T : (h0*w0 + h1*w1) + (h2*w2 + h3*w3)
         for (tk = 0; tk < 16; tk = tk + 1) begin
             for (c = 0; c < 4; c = c + 1) begin
 `ifdef GOLD_WT
@@ -414,17 +414,17 @@ task golden_task;
                 fmul(gh[tk*4 + 1], w_mem[gwb + 1*4 + c]); x_b = t_z;
                 fadd(x_a, x_b);                           x_c = t_z;
                 fmul(gh[tk*4 + 2], w_mem[gwb + 2*4 + c]); x_a = t_z;
-                fadd(x_c, x_a);                           x_c = t_z;
                 fmul(gh[tk*4 + 3], w_mem[gwb + 3*4 + c]); x_b = t_z;
+                fadd(x_a, x_b);                           x_a = t_z;
 `else
                 fmul(gh[tk*4 + 0], w_mem[gwb + c*4 + 0]); x_a = t_z;
                 fmul(gh[tk*4 + 1], w_mem[gwb + c*4 + 1]); x_b = t_z;
                 fadd(x_a, x_b);                           x_c = t_z;
                 fmul(gh[tk*4 + 2], w_mem[gwb + c*4 + 2]); x_a = t_z;
-                fadd(x_c, x_a);                           x_c = t_z;
                 fmul(gh[tk*4 + 3], w_mem[gwb + c*4 + 3]); x_b = t_z;
+                fadd(x_a, x_b);                           x_a = t_z;
 `endif
-                fadd(x_c, x_b);
+                fadd(x_c, x_a);
                 gold_mem[gb + tk*4 + c] = t_z;
             end
         end
