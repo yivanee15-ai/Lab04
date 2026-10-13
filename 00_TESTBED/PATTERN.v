@@ -19,8 +19,12 @@
 //
 // input.txt  (per pattern, 208 words) : 64 lines "K Q V" (raster order, hex), then 16 lines "out_weight"
 // output.txt (per pattern,  64 words) : 64 lines of the expected out (raster order, hex)
-`define INPUT_FILE      "../00_TESTBED/input.txt"
-`define OUTPUT_FILE     "../00_TESTBED/output.txt"
+`ifndef INPUT_FILE
+  `define INPUT_FILE    "../00_TESTBED/input.txt"
+`endif
+`ifndef OUTPUT_FILE
+  `define OUTPUT_FILE   "../00_TESTBED/output.txt"
+`endif
 
 
 
@@ -283,6 +287,12 @@ DW_fp_exp  #(inst_sig_width, inst_exp_width, inst_ieee_compliance, inst_arch)
 DW_fp_cmp  #(inst_sig_width, inst_exp_width, inst_ieee_compliance)
     G_CMP  (.a(gc_a), .b(gc_b), .zctr(1'b0), .aeqb(), .altb(), .agtb(gc_gt),
             .unordered(), .z0(), .z1(), .status0(), .status1());
+`ifdef GOLD_QK_DP2
+reg  [31:0] gp_a, gp_b, gp_c, gp_d;  wire [31:0] gp_z;
+DW_fp_dp2  #(inst_sig_width, inst_exp_width, inst_ieee_compliance, inst_arch_type)
+    G_DP2  (.a(gp_a), .b(gp_b), .c(gp_c), .d(gp_d), .rnd(3'b000), .z(gp_z), .status());
+task fdp2; input [31:0] a, b, c, d; begin gp_a = a; gp_b = b; gp_c = c; gp_d = d; #1; t_z = gp_z; end endtask
+`endif
 
 reg [31:0] t_z;
 reg        t_g;
@@ -326,9 +336,13 @@ task golden_task;
                             x_q1 = q_mem[gb + (2*bi + r)*4 + 2*hh + 1];
                             x_k0 = k_mem[gb + (2*bj + c)*4 + 2*hh];
                             x_k1 = k_mem[gb + (2*bj + c)*4 + 2*hh + 1];
+`ifdef GOLD_QK_DP2
+                            fdp2(x_q0, x_k0, x_q1, x_k1); x_c = t_z;     // one rounding
+`else
                             fmul(x_q0, x_k0); x_a = t_z;
                             fmul(x_q1, x_k1); x_b = t_z;
                             fadd(x_a, x_b);   x_c = t_z;
+`endif
                             fdiv(x_c, SQRT2); gs[r*2 + c] = t_z;
                         end
                     end
@@ -386,12 +400,21 @@ task golden_task;
         // concat x Out_weight^T : ((h0*w0 + h1*w1) + h2*w2) + h3*w3
         for (tk = 0; tk < 16; tk = tk + 1) begin
             for (c = 0; c < 4; c = c + 1) begin
+`ifdef GOLD_WT
+                fmul(gh[tk*4 + 0], w_mem[gwb + 0*4 + c]); x_a = t_z;
+                fmul(gh[tk*4 + 1], w_mem[gwb + 1*4 + c]); x_b = t_z;
+                fadd(x_a, x_b);                           x_c = t_z;
+                fmul(gh[tk*4 + 2], w_mem[gwb + 2*4 + c]); x_a = t_z;
+                fadd(x_c, x_a);                           x_c = t_z;
+                fmul(gh[tk*4 + 3], w_mem[gwb + 3*4 + c]); x_b = t_z;
+`else
                 fmul(gh[tk*4 + 0], w_mem[gwb + c*4 + 0]); x_a = t_z;
                 fmul(gh[tk*4 + 1], w_mem[gwb + c*4 + 1]); x_b = t_z;
                 fadd(x_a, x_b);                           x_c = t_z;
                 fmul(gh[tk*4 + 2], w_mem[gwb + c*4 + 2]); x_a = t_z;
                 fadd(x_c, x_a);                           x_c = t_z;
                 fmul(gh[tk*4 + 3], w_mem[gwb + c*4 + 3]); x_b = t_z;
+`endif
                 fadd(x_c, x_b);
                 gold_mem[gb + tk*4 + c] = t_z;
             end

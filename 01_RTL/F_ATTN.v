@@ -55,6 +55,9 @@ parameter SIG_W    = 23;
 parameter EXP_W    = 8;
 parameter IEEE_C   = 0;
 parameter EXP_ARCH = 0;
+parameter QK_DP2   = 0;     // 1: q0*k0 + q1*k1 with one DW_fp_dp2 (single rounding) instead of 2 mult + 1 add
+parameter DP_ARCH  = 0;     // arch_type of DW_fp_dp2
+parameter W_T      = 0;     // 1: out_weight is delivered already transposed (Final = Concat x W)
 parameter P7_DLY   = 4;     // output start = first phase-7 issue + 2 + P7_DLY cycles
 
 localparam [31:0] SQRT2 = 32'h3FB504F3;     // sqrt(2), constant given in the lab PDF
@@ -69,6 +72,9 @@ localparam [31:0] FP0   = 32'h00000000;
 `define FA_DIV(U_, A_, B_, Z_) \
     DW_fp_div #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C)) \
         U_ (.a(A_), .b(B_), .rnd(3'b000), .z(Z_), .status());
+`define FA_DP2(U_, A_, B_, C_, D_, Z_) \
+    DW_fp_dp2 #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C), .arch_type(DP_ARCH)) \
+        U_ (.a(A_), .b(B_), .c(C_), .d(D_), .rnd(3'b000), .z(Z_), .status());
 `define FA_EXP(U_, A_, Z_) \
     DW_fp_exp #(.sig_width(SIG_W), .exp_width(EXP_W), .ieee_compliance(IEEE_C), .arch(EXP_ARCH)) \
         U_ (.a(A_), .z(Z_), .status());
@@ -135,13 +141,22 @@ wire [31:0] k01 = k_r[{tj, 1'b0, shd, 1'b1}];
 wire [31:0] k10 = k_r[{tj, 1'b1, shd, 1'b0}];
 wire [31:0] k11 = k_r[{tj, 1'b1, shd, 1'b1}];
 
-wire [31:0] f1_p00, f1_p01, f1_p10, f1_p11, f1_s0, f1_s1;
-`FA_MUL(u_f1_m00, q0, k00, f1_p00)
-`FA_MUL(u_f1_m01, q1, k01, f1_p01)
-`FA_MUL(u_f1_m10, q0, k10, f1_p10)
-`FA_MUL(u_f1_m11, q1, k11, f1_p11)
-`FA_ADD(u_f1_a0, f1_p00, f1_p01, f1_s0)
-`FA_ADD(u_f1_a1, f1_p10, f1_p11, f1_s1)
+wire [31:0] f1_s0, f1_s1;
+generate
+    if (QK_DP2 != 0) begin : G_QK_FUSED
+        `FA_DP2(u_f1_d0, q0, k00, q1, k01, f1_s0)
+        `FA_DP2(u_f1_d1, q0, k10, q1, k11, f1_s1)
+    end
+    else begin : G_QK_SEP
+        wire [31:0] f1_p00, f1_p01, f1_p10, f1_p11;
+        `FA_MUL(u_f1_m00, q0, k00, f1_p00)
+        `FA_MUL(u_f1_m01, q1, k01, f1_p01)
+        `FA_MUL(u_f1_m10, q0, k10, f1_p10)
+        `FA_MUL(u_f1_m11, q1, k11, f1_p11)
+        `FA_ADD(u_f1_a0, f1_p00, f1_p01, f1_s0)
+        `FA_ADD(u_f1_a1, f1_p10, f1_p11, f1_s1)
+    end
+endgenerate
 
 // pipeline control: valid bit and tag {hd, i, r, j} per stage
 reg        va, vb, vc, vd, ve;
@@ -270,10 +285,12 @@ wire [31:0] o_l   = l_arr[eo];
 wire [31:0] o_dz;
 `FA_DIV(u_o_d, o_acc, o_l, o_dz)
 
-wire [31:0] wk0 = w_r[{oc[1:0], 2'd0}];
-wire [31:0] wk1 = w_r[{oc[1:0], 2'd1}];
-wire [31:0] wk2 = w_r[{oc[1:0], 2'd2}];
-wire [31:0] wk3 = w_r[{oc[1:0], 2'd3}];
+// W_T = 0 : Final[t][c] = sum_k Concat[t][k] * W[c][k]   (W row c at index c*4+k)
+// W_T = 1 : Final[t][c] = sum_k Concat[t][k] * W[k][c]   (index k*4+c)
+wire [31:0] wk0 = w_r[(W_T != 0) ? {2'd0, oc[1:0]} : {oc[1:0], 2'd0}];
+wire [31:0] wk1 = w_r[(W_T != 0) ? {2'd1, oc[1:0]} : {oc[1:0], 2'd1}];
+wire [31:0] wk2 = w_r[(W_T != 0) ? {2'd2, oc[1:0]} : {oc[1:0], 2'd2}];
+wire [31:0] wk3 = w_r[(W_T != 0) ? {2'd3, oc[1:0]} : {oc[1:0], 2'd3}];
 wire [31:0] o_m0, o_m1, o_m2, o_m3, o_a01, o_b, o_c;
 `FA_MUL(u_o_m0, ho0, wk0, o_m0)
 `FA_MUL(u_o_m1, ho1, wk1, o_m1)
@@ -404,6 +421,7 @@ end
 `undef FA_MUL
 `undef FA_ADD
 `undef FA_DIV
+`undef FA_DP2
 `undef FA_EXP
 `undef FA_GT
 
