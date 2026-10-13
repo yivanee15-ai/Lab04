@@ -58,6 +58,7 @@ parameter EXP_ARCH = 0;
 parameter QK_DP2   = 0;     // 0: q0*k0 + q1*k1 with 2 mult + 1 add, 1: one DW_fp_dp2 (single rounding)
 parameter DP_ARCH  = 0;     // arch_type of DW_fp_dp2
 parameter W_T      = 0;     // 1: out_weight is delivered already transposed (Final = Concat x W)
+parameter Q_PRE    = 1;     // 1: Q is divided by sqrt2 as it arrives (matches TA golden), 0: S divided by sqrt2 after QK
 parameter P7_DLY   = 4;     // output start = first phase-7 issue + 2 + P7_DLY cycles
 
 localparam [31:0] SQRT2 = 32'h3FB504F3;     // sqrt(2), constant given in the lab PDF
@@ -98,11 +99,21 @@ reg [31:0] k_r [0:63];
 reg [31:0] v_r [0:63];
 reg [31:0] w_r [0:15];
 
-reg [6:0]  ld_cnt;                      // input beats stored so far (0..64)
+reg [6:0]  ld_cnt;                      // input beats received so far (0..64)
+reg [6:0]  ld_q;                        // ld_cnt delayed one cycle (Q is stored one cycle later)
+
+reg [31:0] qin_r;                       // Q delayed one beat, then (optionally) scaled
+reg [5:0]  qin_i;
+reg        qin_v;
+wire [31:0] qin_s;
+`FA_DIV(u_q_d, qin_r, SQRT2, qin_s)
 
 always @(posedge clk) begin
+    qin_r <= Q;
+    qin_i <= ld_cnt[5:0];
+    qin_v <= in_valid;
+    if (qin_v) q_r[qin_i] <= (Q_PRE != 0) ? qin_s : qin_r;
     if (in_valid) begin
-        q_r[ld_cnt[5:0]] <= Q;
         k_r[ld_cnt[5:0]] <= K;
         v_r[ld_cnt[5:0]] <= V;
         if (ld_cnt < 7'd16) w_r[ld_cnt[3:0]] <= out_weight;
@@ -129,7 +140,7 @@ wire       col   = (sidx < {1'b0, sb});             // column tile: (i = idx, j 
 wire [2:0] ti    = col ? sidx[2:0] : sb;
 wire [3:0] rdiff = sidx - {1'b0, sb};
 wire [2:0] tj    = col ? sb : rdiff[2:0];
-wire       issue = !sdone && (ld_cnt >= {(sb == 3'd7), (sb + 3'd1) & 3'b111, 3'b000});
+wire       issue = !sdone && (ld_q >= {(sb == 3'd7), (sb + 3'd1) & 3'b111, 3'b000});
 
 //---------------------------------------------------------------------
 //  F1 : q*k, add
@@ -172,8 +183,13 @@ reg [31:0] am0, am1, lm, pv0, pv1, ps;  // after R3
 //  F2 : divide by sqrt2
 //---------------------------------------------------------------------
 wire [31:0] f2_s0, f2_s1;
-`FA_DIV(u_f2_d0, sc0, SQRT2, f2_s0)
-`FA_DIV(u_f2_d1, sc1, SQRT2, f2_s1)
+generate if (Q_PRE != 0) begin : G_NOSC
+    assign f2_s0 = sc0;
+    assign f2_s1 = sc1;
+end else begin : G_SC
+    `FA_DIV(u_f2_d0, sc0, SQRT2, f2_s0)
+    `FA_DIV(u_f2_d1, sc1, SQRT2, f2_s1)
+end endgenerate
 
 //---------------------------------------------------------------------
 //  R1 : running max, subtract
@@ -327,6 +343,7 @@ wire first_issue7 = issue && (sb == 3'd7) && (sidx == 4'd0) && !shd && !sq_r;
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         ld_cnt    <= 7'd0;
+        ld_q      <= 7'd0;
         sb        <= 3'd0;
         sidx      <= 4'd0;
         shd       <= 1'b0;
@@ -343,6 +360,7 @@ always @(posedge clk or negedge rst_n) begin
         out       <= 32'd0;
     end
     else begin
+        ld_q <= ld_cnt;
         if (in_valid) ld_cnt <= ld_cnt + 7'd1;
 
         // pipeline valid bits
@@ -403,6 +421,7 @@ always @(posedge clk or negedge rst_n) begin
         O_DONE: begin                   // clear for the next run
             ost    <= O_IDLE;
             ld_cnt <= 7'd0;
+            ld_q   <= 7'd0;
             sb     <= 3'd0;
             sidx   <= 4'd0;
             shd    <= 1'b0;

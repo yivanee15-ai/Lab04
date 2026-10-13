@@ -335,6 +335,10 @@ task golden_task;
                         for (c = 0; c < 2; c = c + 1) begin
                             x_q0 = q_mem[gb + (2*bi + r)*4 + 2*hh];
                             x_q1 = q_mem[gb + (2*bi + r)*4 + 2*hh + 1];
+`ifndef GOLD_SCALE_S
+                            fdiv(x_q0, SQRT2); x_q0 = t_z;                // TA golden: Q / sqrt2 before QK
+                            fdiv(x_q1, SQRT2); x_q1 = t_z;
+`endif
                             x_k0 = k_mem[gb + (2*bj + c)*4 + 2*hh];
                             x_k1 = k_mem[gb + (2*bj + c)*4 + 2*hh + 1];
 `ifdef GOLD_QK_DP2
@@ -344,7 +348,11 @@ task golden_task;
                             fmul(x_q1, x_k1); x_b = t_z;
                             fadd(x_a, x_b);   x_c = t_z;
 `endif
+`ifdef GOLD_SCALE_S
                             fdiv(x_c, SQRT2); gs[r*2 + c] = t_z;
+`else
+                            gs[r*2 + c] = x_c;
+`endif
                         end
                     end
 
