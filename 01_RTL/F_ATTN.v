@@ -15,7 +15,7 @@
 //   * A tile is issued as two row-tasks (row 0, row 1) per head, heads alternate:
 //         (hd0,r0) (hd0,r1) (hd1,r0) (hd1,r1)   -> 1 row-task per cycle, same chain every >=4 cycles
 //   * Row-task pipeline (every stage has its own units, no operand muxes):
-//         F1 : s_raw = q0*k0 + q1*k1 with one DW_fp_dp2 per score (2 dp2); QK_DP2=0 uses 4 mult + 2 add
+//         F1 : prod = q*k (4 mult), s_raw = prod0 + prod1 (2 add); QK_DP2=1 uses 2 DW_fp_dp2 instead
 //         F2 : s = s_raw / sqrt2                      (2 div)
 //         R1 : rmax, m_new = max(m, rmax)             (2 cmp)   m state read / written here
 //              ds = s - m_new, dm = m - m_new         (3 add, negated operand)
@@ -55,7 +55,7 @@ parameter SIG_W    = 23;
 parameter EXP_W    = 8;
 parameter IEEE_C   = 0;
 parameter EXP_ARCH = 0;
-parameter QK_DP2   = 1;     // 1: q0*k0 + q1*k1 with one DW_fp_dp2 (single rounding), 0: 2 mult + 1 add
+parameter QK_DP2   = 0;     // 0: q0*k0 + q1*k1 with 2 mult + 1 add, 1: one DW_fp_dp2 (single rounding)
 parameter DP_ARCH  = 0;     // arch_type of DW_fp_dp2
 parameter W_T      = 0;     // 1: out_weight is delivered already transposed (Final = Concat x W)
 parameter P7_DLY   = 4;     // output start = first phase-7 issue + 2 + P7_DLY cycles

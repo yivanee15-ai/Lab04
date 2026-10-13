@@ -8,12 +8,7 @@
 `define ERR_TOL         1.0e-7
 `define MAX_LATENCY     1000
 `define DIRECTED_NUM    13          // corner-case patterns before the random ones
-// golden QK score: one DW_fp_dp2 by default (matches F_ATTN QK_DP2 = 1); +define+GOLD_QK_MULADD for 2 mult + 1 add
-`ifndef GOLD_QK_MULADD
-  `ifndef GOLD_QK_DP2
-    `define GOLD_QK_DP2
-  `endif
-`endif
+// golden QK score: 2 mult + 1 add by default (matches F_ATTN QK_DP2 = 0); +define+GOLD_QK_DP2 for one DW_fp_dp2
 `ifndef GAP_MIN
   `define GAP_MIN       1           // negative edges to wait after the first idle sample (1 -> in_valid at the 2nd edge)
 `endif
