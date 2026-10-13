@@ -105,8 +105,7 @@ reg [6:0]  ld_q;                        // ld_cnt delayed one cycle (Q is stored
 reg [31:0] qin_r;                       // Q delayed one beat, then (optionally) scaled
 reg [5:0]  qin_i;
 reg        qin_v;
-wire [31:0] qin_s;
-`FA_DIV(u_q_d, qin_r, SQRT2, qin_s)
+wire [31:0] qin_s;                      // from the shared divider below (output engine idle while Q arrives)
 
 always @(posedge clk) begin
     qin_r <= Q;
@@ -299,7 +298,14 @@ wire [4:0] eo   = {pcur[1], tp};        // {hd, token}
 wire [31:0] o_acc = acc_arr[{eo, pcur[0]}];
 wire [31:0] o_l   = l_arr[eo];
 wire [31:0] o_dz;
-`FA_DIV(u_o_d, o_acc, o_l, o_dz)
+// one divider for both jobs: Q / sqrt2 while inputs arrive, acc / l once the output engine runs
+wire        o_act = (ost == O_PREP) || (ost == O_RUN);
+wire [31:0] dv_a  = o_act ? o_acc : qin_r;
+wire [31:0] dv_b  = o_act ? o_l   : SQRT2;
+wire [31:0] dv_z;
+`FA_DIV(u_o_d, dv_a, dv_b, dv_z)
+assign o_dz  = dv_z;
+assign qin_s = dv_z;
 
 // W_T = 0 : Final[t][c] = sum_k Concat[t][k] * W[c][k]   (W row c at index c*4+k)
 // W_T = 1 : Final[t][c] = sum_k Concat[t][k] * W[k][c]   (index k*4+c)
